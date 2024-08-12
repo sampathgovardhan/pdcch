@@ -1,0 +1,499 @@
+//! @copyright
+//! Copyright (c) 2016-2022, WiSig Networks Pvt Ltd. All rights reserved. www.wisig.com
+//! All information contained herein is property of WiSig Networks Pvt Ltd. unless otherwise
+//! explicitly mentioned.
+//! The intellectual and technical concepts in this file are proprietary to WiSig Networks and
+//! may be covered by granted or in process national and international patents and are
+//! protect by trade secrets and copyright law.
+//! Redistribution and use in source and binary forms of the content in this file, with or
+//! without modification are not permitted unless permission is explicitly granted by WiSig Networks.
+//!
+//! @author @nikhil-wisig
+//! @version 1.0
+//! @date 09-05-2022
+//! @brief module for angle generation as part of the correction subsystem. This is connected to a
+//! cordic vector module on the slave side and a cordic rotation module on the master side.
+//!
+//! Fixed point formats:
+//! The input to cordic vector module is assumed to be in signed Q1.(W1 - 1) ans the output is
+//! given out in unsigned Q0.W2 + 2 bits for sign. The Angle gen module will read this input,
+//! process it, and generate an output in the same format. The cordic rotation module reads Q0.W2
+//! input and generates an output in signed Q1.(W1 - 1) format
+
+`timescale 1ns / 1ps
+
+
+`ifndef __HEADER_INCLUDE1__
+`define __HEADER_INCLUDE1__
+`include "pdcchrx.svh"
+`endif
+
+        module wn_pdcchrx_anglegen #(
+            parameter int DW_ANGLE = 16,
+            parameter int DW_SIGN = 2,
+            parameter int DW_IN = DW_ANGLE + DW_SIGN,
+            parameter int ENABLE_IN_SKID = 1,
+            parameter int ENABLE_OUT_SKID = 1,
+            //! bitwidth for loopcount
+            parameter int DW_COUNT = 8,
+            parameter int DW_PRB_COUNT = 9,
+            parameter int DW_SYM_COUNT = 2,
+            parameter int OPT_CORRECTION = 1  //2 -> for PBCH time offset correction
+            // 1 -> if you want to use this module for time offset correction
+            // 0 -> if you want to use this module for frequency offset correction
+
+          ) (
+            //! System Clock
+            input clk,
+            //! Reset - Negedge triggered
+            input reset_n,
+            //! @virtualbus data_in @dir in AXIS bus for input data
+            //! input data - axis port
+            input [$bits(pdcchrx_anglegen_t) - 1:0] param_tdata,
+            //! input valid - axis port
+            input param_tvalid,
+            //! input ready - axis port
+            output param_tready,  //! @end
+            //! @virtualbus data_in @dir in AXIS bus for input data
+            //! input data - axis port
+            input [DW_IN - 1:0] s_tdata,
+            //! input valid - axis port
+            input s_tvalid,
+            //! input ready - axis port
+            output s_tready,  //! @end
+            //! @virtualbus data_out @dir out AXIS bus for output data
+            //! data output - axis port
+            output [DW_IN - 1:0] m_tdata,
+            //! valid output - axis port
+            output m_tvalid,
+            //! ready output axis port
+            input m_tready  //! @end
+          );
+          //! number of bits to represent the input config
+          localparam int DW_PARAM = $bits(pdcchrx_anglegen_t);
+          localparam [DW_ANGLE:0] plus_one = {1'b0, {DW_ANGLE{1'b1}}};
+          localparam [DW_ANGLE:0] minus_one = {1'b1, {DW_ANGLE{1'b0}}};
+          //! 1 additional bit for signed x unsigned multiplication
+          localparam DW_ANGLE_FULL_RANGE = DW_COUNT + DW_ANGLE + 2;
+          localparam int I_ANGLE_FULL_RANGE = DW_COUNT + 2;
+          //! input data internal variables
+          logic param_tvalid_i;
+          logic [DW_PARAM - 1:0] param_tdata_i;
+          logic param_tready_i;
+          pdcchrx_anglegen_t rd_param, rd_param_wire;
+          //! input data internal variables
+          logic s_tvalid_i;
+          logic [DW_IN - 1:0] s_tdata_i;
+          logic s_tready_i;
+          logic [DW_SIGN - 1:0] rd_sign;
+          //! rd_data is the signed version of the input. The input angle is always +ve.
+          //! The input angle is shifted back to its original form y using trignometric identities
+          logic signed [DW_ANGLE:0] rd_data,rd_data_i;
+          //! output data internal variable
+          logic [DW_IN - 1:0] m_tdata_i;
+          logic m_tvalid_i;
+          logic m_tready_i;
+          //! variable to store the angle in full range (before shifting it back to [0, 2pi])
+          logic [DW_ANGLE_FULL_RANGE - 1:0] angle_full_range;
+          logic [DW_COUNT - 1:0] count;
+          logic [DW_COUNT - 1:0] counter;
+          logic [DW_PRB_COUNT - 1:0] prb_count;
+          logic [DW_SYM_COUNT - 1:0] sym_count;
+          logic signed [DW_COUNT : 0] count_pbch;
+          enum reg [2:0] {
+                 RD_PARAM,
+                 RD_DATA,
+                 PROCESSING_TOC,
+                 PROCESSING_FOC,
+                 PROCESSING_PBCH_TOC,
+                 WR_LAST,
+                 WR_LAST_PBCH_TOC
+               }
+               state, next;
+          halfbuffer #(
+                       .DW(DW_PARAM)
+                     ) inst_param (
+                       .clk(clk),
+                       .reset_n(reset_n),
+                       .s_tvalid(param_tvalid),
+                       .s_tready(param_tready),
+                       .s_tdata(param_tdata),
+                       .m_tvalid(param_tvalid_i),
+                       .m_tready(param_tready_i),
+                       .m_tdata(param_tdata_i)
+                     );
+          generate
+            if (ENABLE_IN_SKID)
+            begin
+              //! skid buffer for input data
+              skidbuffer #(
+                           .DW(DW_IN)
+                         ) inst_in (
+                           .clock(clk),
+                           .reset(~reset_n),
+                           .input_tvalid(s_tvalid),
+                           .input_tready(s_tready),
+                           .input_tdata(s_tdata),
+                           .output_tvalid(s_tvalid_i),
+                           .output_tready(s_tready_i),
+                           .output_tdata(s_tdata_i)
+                         );
+            end
+            else
+            begin
+              assign s_tvalid_i = s_tvalid;
+              assign s_tdata_i  = s_tdata;
+              assign s_tready   = s_tready_i;
+            end
+            if (ENABLE_OUT_SKID)
+            begin
+              //! skid buffer for data output
+              skidbuffer #(
+                           .DW(DW_IN)
+                         ) inst_out (
+                           .clock(clk),
+                           .reset(~reset_n),
+                           .input_tvalid(m_tvalid_i),
+                           .input_tready(m_tready_i),
+                           .input_tdata(m_tdata_i),
+                           .output_tvalid(m_tvalid),
+                           .output_tready(m_tready),
+                           .output_tdata(m_tdata)
+                         );
+            end
+            else
+            begin
+              assign m_tdata = m_tdata_i;
+              assign m_valid = m_tvalid_i;
+              assign m_tready_i = m_tready;
+            end
+          endgenerate
+          //! rounding angle in full range to [0, pi/2]
+          wn_pdcchrx_angle_rounding #(
+                                      .W_IN (DW_ANGLE_FULL_RANGE),
+                                      .I_IN (I_ANGLE_FULL_RANGE),
+                                      .W_OUT(DW_ANGLE)
+                                    ) inst_rounding (
+                                      .angle_in (angle_full_range),
+                                      .angle_out(m_tdata_i[0 +: DW_ANGLE]),
+                                      .sign_out (m_tdata_i[DW_ANGLE +: DW_SIGN])
+                                    );
+          //! Sequential block for present-state FSM logic
+          always_ff @(posedge clk)
+          begin : PRESENT_STATE_FSM
+            if (!reset_n)
+            begin
+              state <= RD_PARAM;
+            end
+            else
+            begin
+              state <= next;
+            end
+          end
+          //! Combinational block for next-state FSM logic
+          always_comb
+          begin : next_FSM
+            next = RD_PARAM;
+            case (state)
+              RD_PARAM:
+              begin
+                if (param_tvalid_i)
+                begin
+                  next = RD_DATA;
+                end
+                else
+                begin
+                  next = RD_PARAM;
+                end
+              end
+              RD_DATA:
+              begin
+                if(s_tvalid_i)
+                begin
+                  if(OPT_CORRECTION)
+                    next = PROCESSING_TOC;
+                  else
+                    next = PROCESSING_FOC;
+                end
+                else
+                begin
+                  next = RD_DATA;
+                end
+              end
+              PROCESSING_TOC:
+              begin
+                if (counter == rd_param.loopcount - 1 && m_tready_i)
+                begin
+                  next = WR_LAST;
+                end
+                else
+                begin
+                  next = PROCESSING_TOC;
+                end
+              end
+              PROCESSING_FOC:
+              begin
+                if (counter == rd_param.loopcount - 1 && m_tready_i)
+                begin
+                  next = WR_LAST;
+                end
+                else
+                begin
+                  next = PROCESSING_FOC;
+                end
+              end
+              WR_LAST:
+              begin
+                if(m_tready_i )
+                begin
+                  if(sym_count == rd_param.num_sym - 1 && prb_count == rd_param.num_prb - 1)
+                    next = RD_PARAM;
+                  else
+                  begin
+                    next = RD_DATA;
+                  end
+                end
+                else
+                begin
+                  next = WR_LAST;
+                end
+              end
+            endcase
+          end
+          assign s_tready_i = (state == RD_DATA);
+          assign param_tready_i = (state == RD_PARAM);
+          //assign RD_PARAM_wire = s_tdata_i;
+          assign rd_sign = s_tdata_i[DW_IN - 1 -: DW_SIGN];
+          always_ff @(posedge clk)
+          begin
+            case (state)
+              RD_PARAM:
+              begin
+                if (param_tvalid_i)
+                begin
+                  rd_param <= param_tdata_i;
+                end
+                count <= 0;
+                prb_count <= 0;
+                sym_count <= 0;
+                m_tvalid_i <= 0;
+                counter <= 0;
+              end
+              RD_DATA:
+              begin
+                if(s_tvalid_i)
+                begin
+
+                  if(!OPT_CORRECTION)
+                  begin
+                    count <= sym_count;
+                    case(s_tdata_i[DW_IN - 1 -: DW_SIGN])
+                      0:
+                      begin
+                        rd_data <= {1'b0,s_tdata_i[DW_ANGLE - 1:0]};
+                      end
+                      1:
+                      begin
+                        rd_data <= $signed(plus_one) - $signed({1'b0,s_tdata_i[DW_ANGLE - 1:0]});
+
+                      end
+                      2:
+                      begin
+                        rd_data <= 'd0 - $signed({1'b0, s_tdata_i[DW_ANGLE-1:0]});
+
+                      end
+                      3:
+                      begin
+                        rd_data <= $signed({1'b0, s_tdata_i[DW_ANGLE-1:0]}) +
+                        $signed(minus_one);
+                      end
+                    endcase
+
+                  end
+                  else
+                  begin
+                    if (OPT_CORRECTION == 1)
+                      count <= count;
+                    else
+                      count_pbch <= $signed({1'b0, rd_param.loopcount}) - 'd239;
+
+                    case (s_tdata_i[DW_IN-1-:DW_SIGN])
+                      0:
+                      begin
+                        rd_data <= {1'b0, (s_tdata_i[DW_ANGLE-1:0] >> 2)};
+                      end
+                      1:
+                      begin
+                        rd_data <= ($signed(plus_one) -
+                                    $signed({1'b0, (s_tdata_i[DW_ANGLE-1:0])})) >>> 2;
+                      end
+                      2:
+                      begin
+                        rd_data <= 'd0 - $signed({1'b0, (s_tdata_i[DW_ANGLE-1:0] >> 2)});
+                      end
+                      3:
+                      begin
+                        rd_data <= ($signed({1'b0, (s_tdata_i[DW_ANGLE-1:0])}) +
+                                    $signed(minus_one)) >>> 2;
+                      end
+                    endcase
+
+                  end
+                end
+              end
+
+
+              PROCESSING_PBCH_TOC:
+              begin
+                if (m_tready_i)
+                begin
+                  if (sym_count == 1 && counter == 47)
+                  begin
+                    counter <= 192;
+                    count_pbch <= count_pbch + 1'b1 + 'd144;
+                  end
+                  else
+                  begin
+                    counter <= counter + 1'b1;
+                    count_pbch <= count_pbch + 1'b1;
+                  end
+                  m_tvalid_i <= 1;
+                end
+              end
+              PROCESSING_TOC:
+              begin
+                if (m_tready_i)
+                begin
+                  counter <= counter + 1'b1;
+                  count <= count + 1'b1;
+                  m_tvalid_i <= 1;
+                end
+              end
+              PROCESSING_FOC:
+              begin
+                if (m_tready_i)
+                begin
+                  counter <= counter + 1'b1;
+                  count <= sym_count;
+                  m_tvalid_i <= 1;
+                end
+              end
+              WR_LAST:
+              begin
+                if(m_tready_i)
+                begin
+                  m_tvalid_i <= 0;
+                  counter <= 0;
+                  if(prb_count == rd_param.num_prb - 1)
+                  begin
+                    if(OPT_CORRECTION)
+                      count <= 0;
+                    else
+                      count <= count + 1'b1;
+                    sym_count <= sym_count + 1'b1;
+                    prb_count <= 0;
+                  end
+                  else
+                  begin
+                    prb_count <= prb_count + 1'b1;
+                    if(OPT_CORRECTION)
+                    begin
+                      if((rd_param.num_sym == 1 && count < 72) || (rd_param.num_sym == 2 && count < 36) || (rd_param.num_sym == 3 && count < 24) )
+                        count <= count;
+                      else
+                        count <= 0;
+                    end
+                    else
+                      count <= count;
+                  end
+                end
+              end
+            endcase
+          end
+          always_ff @(posedge clk)
+          begin
+            if(m_tready_i)
+            begin
+              //! signed Q0.16 x unsigned QDW_COUNT.0
+              //! signed Q(DW_COUNT).16
+              angle_full_range <= (rd_data) * $signed({1'b0,count});
+            end
+          end
+        endmodule
+        //! @brief module for rounding any angle in radians to [0 pi/2]
+        //!
+        //! As all our cordic modules use binary angles, the computation becomes as
+        //! simple as just picking the right bits
+        module wn_pdcchrx_angle_rounding #(
+            parameter int W_IN  = 32,
+            parameter int I_IN  = 16,
+            parameter int W_OUT = 16
+          ) (
+            input logic signed [W_IN - 1:0] angle_in,
+            output logic [W_OUT + 1:0] angle_out,
+            output logic [1:0] sign_out
+          );
+          localparam int F_IN = W_IN - I_IN;
+          localparam F_OUT = W_OUT;
+          //! 0.5 in unsigned QI_OUT.F_OUT format
+          localparam int POINT_FIVE = 2**(F_OUT - 1);
+          //! 1 in unsigned QI_OUT.F_OUT format
+          localparam int ONE_P_ZERO = 2**(F_OUT);
+          //! 1.5 in unsigned QI_OUT.F_OUT format
+          localparam int ONE_POINT_FIVE = {2'b11, {(F_OUT - 1){1'b0}}};
+          //! 2.0 in unsigned QI_OUT.F_OUT format
+          localparam int TWO_POINT_ZERO = 2**(F_OUT + 1);
+          //! angle_in is in signed QI_IN.(W_IN - I_IN).
+          //! angle_out is in unsigned Q0.(W_OUT)
+          //! temp_angle is unsigned Q1.(W_OUT)
+          //! temp angle uses 1 bit more than the output. The output will be in Q0.(W_OUT) format
+          //! temp angle will be in Q1.(W_OUT). Typically, the output is in Q1.15 while the temp
+          //! is in Q2.15
+          logic [W_OUT:0] temp_angle;
+          logic signed [W_IN - 1:0] neg_angle_in;
+          logic sign_in;
+          always_comb
+          begin
+            // the sign bit is set to 0 as the cordic module cannot handle -ve angles
+            // the sign of angle is taken care of in the sign_out signal
+            //        temp_angle[W_OUT] = 0;
+            // use the sign of angle to compute sign_out
+            sign_in = angle_in[W_IN-1];
+            neg_angle_in = -angle_in;
+            //! picking the right set of bits to compute mod2
+            if(sign_in == 0)
+            begin
+              //! if angle_in is +ve, bit picking is straight forward
+              temp_angle[W_OUT:0] = angle_in[F_IN-:(W_OUT + 1)];
+            end
+            else
+            begin
+              //! if angle_in is -ve, compute -angle_in and then pick bits
+              temp_angle[W_OUT:0] = neg_angle_in[F_IN-:(W_OUT + 1)];
+            end
+            if (temp_angle < POINT_FIVE)
+            begin
+              sign_out[0] = 0;
+              sign_out[1] = sign_in;
+              angle_out   = temp_angle[15:0];
+            end
+            else if (temp_angle < ONE_P_ZERO)
+            begin
+              sign_out[0] = 1;
+              sign_out[1] = sign_in;
+              angle_out   = ONE_P_ZERO - temp_angle[15:0];
+            end
+            else if (temp_angle < ONE_POINT_FIVE)
+            begin
+              sign_out[0] = 1;
+              sign_out[1] = ~sign_in;
+              angle_out   = temp_angle[15:0] - ONE_P_ZERO;
+            end
+            else
+            begin
+              sign_out[0] = 0;
+              sign_out[1] = ~sign_in;
+              angle_out   = TWO_POINT_ZERO - temp_angle[15:0];
+            end
+          end
+        endmodule
